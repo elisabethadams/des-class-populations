@@ -1,6 +1,6 @@
 des-class-populations
 =====================
-Here are the scripts needed to correct your moving object survey for observational biases. Bias factors include: frame latitude, longitude, size, and tilt angle; object H magnitude, semimajor axis, eccentricity, inclination, and apparent magnitude and distance when discovered.
+Here are the scripts needed to correct your moving object survey for observational biases. findProb.py will calculate the debiased probability of finding an object on a set of frames. Bias factors include: frame latitude, longitude, size, and tilt angle; object H magnitude, semimajor axis, eccentricity, inclination, and apparent magnitude and distance when discovered.
 
 Example objects and search frames are taken from the Deep Ecliptic Survey search for Kuiper Belt objects. (Note: full DES frame characteristics not available at this time.)
 
