@@ -3,7 +3,7 @@
 # Calculate de-biased object discovery probabilities
 # If used in research, please cite: 
 #   Adams, E. R., A. A. S. Gulbis, J. L. Elliot, S. D. Benecchi, M. W. Buie, D. E. Trilling, and L.H. Wasserman.
-#   De-biased Populations of Kuiper Belt Objects from the Deep Ecliptic Survey, submitted to AJ Oct 2013
+#   De-biased Populations of Kuiper Belt Objects from the Deep Ecliptic Survey, accepted to AJ, http://arxiv.org/abs/1311.3250
 #
 # Created 2012 June by era
 #   Calculate the detection probability of objects by the DES
@@ -15,6 +15,8 @@
 #		Output intermediate probabilities (which omit one or more of the bias factors)
 #   v3.0, 2013-10-07
 #		Split into two scripts: createInput.py handles making the files, findProb.py only calculates probabilities
+#   v3.2, 2014-06-30
+#   	Latest version after revisions from referee comments (main change: doPiecewise prob(R))
 
 # Note to users: check variables between rows of sharps, e.g.
 ###################################
@@ -32,6 +34,11 @@ from time import clock, time
 # quad requires Fortran! Does your mac come with Fortran? Go install it if not ###
 from scipy.integrate import quad  # integrator
 from scipy.optimize import brentq # root finder
+# For the numeric orbit integration
+from scipy.integrate import simps  # integrator, Simpson's rule
+from scipy import interpolate
+from PyAstronomy import pyasl
+
 
 ###################################
 # User packages are stored here on your machine
@@ -39,6 +46,7 @@ debiasingModuleDirectory = "/Users/era/Research/Projects/Python/modules/"
 ###################################
 sys.path.append(debiasingModuleDirectory) 
 import p4Functions as p4
+import precalc
 
 
 #### Test case values:
@@ -57,6 +65,7 @@ if diag:
 	print "Running test case:"
 	print "a=",useA,"e=",useE,"i=",useI,"H=",useH,"discMag=",useDiscM,"discR=",useDiscR,"testR=",testR
 
+print "\n",precalc.takeClosest(useE)
 
 
 #################### Definitions ###############################################
@@ -75,7 +84,11 @@ scriptDir = mainProjectDir + "Create Probabilities/"
 
 ###################################
 # Different probability runs have been assigned different batch numbers (arbitrary string okay below)
-ourBatch = "Batch32" 
+ourBatch = "Batch32"               # uses piecewise approximation for prob(R)
+#ourBatch = "TestDistPiecewise"    # test of prob(R) method
+#ourBatch = "TestDistApproxEqn"    # test of prob(R) method
+#ourBatch = "TestDistNumericGrid"  # test of prob(R) method
+#ourBatch = "TestDistNumeric"      # test of prob(R) method
 ###################################
 
 ### You likely don't need to modify this (though it should match what's in createInput.py)
@@ -84,14 +97,16 @@ realProbDir = mainProbDir + ourBatch + "/"
 
 ###################################
 # Grids are used to calculate detected fractions
-# Note: the _ is a convention so that the grids appear to the top of the folder 
+# Note: the initial _ is so that the grids are listed at the top of the folder 
 gridDir3to2 = realProbDir+"_Grid_3to2_Big/"
-gridDir7to4 = realProbDir+"_Grid_7to4/"
-gridDir5to2 = realProbDir+"_Grid_5to2/"
-gridDir5to3 = realProbDir+"_Grid_5to3/"
 gridDirScattered = realProbDir+"_Grid_Scattered_Big/"
 gridDirClassical = realProbDir+"_Grid_Classical_Big/"
-gridTest = realProbDir+"_Grid_Test/"
+gridDirScatteredPeri = realProbDir+"_Grid_Scattered_Peri/" # discR = perihelion, not median distance
+gridDir3to2Peri = realProbDir+"_Grid_3to2_Peri/" # discR = perihelion, not median distance
+# Test directories
+gridDirTest = realProbDir+"_Grid_Test/"
+gridDirTestMore = realProbDir+"_Grid_Test_More/"
+gridDirTestFaint = realProbDir+"_Grid_Test_Faint/"
 
 
 ###################################
@@ -100,9 +115,17 @@ gridTest = realProbDir+"_Grid_Test/"
 probabilityDir = realProbDir
 
 # ...or a grid
-#probabilityDir = gridTest
-###################################
+#probabilityDir = gridDir3to2Peri
 
+# Tests of the prob(R) calculation
+# Do we want to use the approximate value for dist v. time, or numerically integrate the orbit for real? (slow!)
+doNumeric = False
+doNumericGrid = False # About half the run time as the straight numeric approach
+## Do we want the piecewise approximation instead of the equation? (YES!)
+doPiecewise = True
+print "Prob(R) method: numeric?",doNumeric," Using a grid?",doNumericGrid," Piecewise?",doPiecewise,"; otherwise use approximation equation"
+
+###################################
 
 print "\nUsing directory: ",probabilityDir,"\n"
 if os.path.exists(probabilityDir) == False:
@@ -113,14 +136,10 @@ inputDir = probabilityDir + "_Input/"
 if os.path.exists(inputDir) == False:
 	exit(["Probability input directory doesn't exist:  "+inputDir])
 
-
 #### Read in all of the extant input files
 allPotentialInput = os.listdir(inputDir)
 
-##### Settings from Elliot 2005 aka Paper II --- these values might change at some point...
-effMax = 1.0 #(* fixed value in Paper II *)
-magRangeFromPaperII = 0.58 #(* value for all VR KBOs from Paper II *)
-
+############### Survey info ###############
 ## To adapt this code to your own survey, you need to know the following for each field:
 ##  field = identifying string for the chip (DES format: FIELD_DATE_N, where N=1-8 since each field is composed of 8 CCDs)
 ##  lat and long =central latitude and longitude (ecliptic)
@@ -129,8 +148,14 @@ magRangeFromPaperII = 0.58 #(* value for all VR KBOs from Paper II *)
 ##  longFrac = longitude fraction (span of field in degrees, divided by 360, accounting for frame tilt)
 ##  usableFrac = amount of field that is searchable, i.e., overlaps two frames, not covered by bright stars/bad pixels/etc.
 ###########################################
-#fieldFile = mainProjectDir+"Summary Files/"+"allFields_Batch31.tsv"  ## full listing of DES fields
-fieldFile = scriptDir+"sampleDESfields.tsv"  ## Contains a sample of 5 DES fields x 8 chips for testing
+##### Settings from Elliot 2005 aka Paper II --- these values might change at some point...
+effMax = 1.0 #(* fixed value in Paper II *)
+magRangeFromPaperII = 0.58 #(* value for all VR KBOs from Paper II *)
+########### Field info file ###############
+## Do we use ALL 18,536 fields, or a small subset for testing?
+fieldFile = mainProjectDir+"Summary Files/"+"allFields_Batch31.tsv"  ## full listing of 18,536 fields
+#fieldFile = mainProjectDir+"Summary Files/"+"someFields_Batch31.tsv"  ## 3568 fields
+#fieldFile = scriptDir+"sampleDESfields.tsv"  ## Contains a sample of 5 x 8 chips = 40 fields for testing
 ###########################################
 
 
@@ -174,17 +199,90 @@ def maxR(a, e):
 
 ## (Equation 6 from Adams2013)
 def probObjAtDistR(R,a,e):
-	if minR(a, e) < R < maxR(a, e): 
+	if minR(a, e) <= R <= maxR(a, e): 
 		return ( 3.*R**2 / (2*e* a**3 * (3 + e**2)) )
 	else:
 		return 0.
+
+## Alt to Eqn: try directly integrating (via review comment)
+def probObjAtDistRinterpFunc(a,e):	
+	## For comparison be sure this agrees with precalculated versions (1000 and 50 default)
+	nTimePoints = 1000; nDistBins = 50
+	useA = a; useE = e
+	useP = useA**(3/2.)
+	print "integrating ellipse model for nTimePoints",nTimePoints,"nDistBins",nDistBins,"a",useA,"e",useE,"P",useP
+	t = np.linspace(0, useP, nTimePoints)
+	ke = pyasl.KeplerEllipse(useA, useP, e=useE) # irrelevant options: i=useI, Omega=0.
+	
+	# Calculate the orbit position at the given points
+	# in a Cartesian coordinate system.
+	pos = ke.xyzPos(t)
+	# Calculate orbit radius as a function of the
+	radius = ke.radius(t)
+	minDist = min(radius)
+	maxDist = max(radius)
+	
+	# Distance bins
+	distBins = np.linspace(minDist, maxDist, nDistBins)
+	midDists = []
+	rDict={}
+	timeR=[]
+	for ii in range(len(distBins)-1):
+		binMiddle = distBins[ii]+0.5*(distBins[ii+1]-distBins[ii])
+		midDists.append( binMiddle )
+		rDict[binMiddle] = 0
+		for rr in radius:
+			if ((rr >= distBins[ii]) & (rr< distBins[ii+1])):
+				rDict[binMiddle] = rDict[binMiddle] +1
+		# Note that this is normalized
+		timeR.append( rDict[binMiddle])
+		
+	# Normalize
+	areaUnderCurve = simps(timeR, dx=distBins[1]-distBins[0])
+	timeRnorm = np.array(timeR) / areaUnderCurve
+	
+	# Interpolate
+	interpFunc = interpolate.interp1d(midDists, timeRnorm, bounds_error=False, fill_value=0)
+	
+	return interpFunc
+
+def probObjAtDistRnumeric(R,a,e):
+	distanceInterpFunction = probObjAtDistRinterpFunc(a,e)
+	return distanceInterpFunction(R)
+
+def probObjAtDistRnumericGridInterpFunc(a,e):
+	ee = precalc.takeClosest(e)
+	if diag:
+		print "loading grid for",e,ee
+	interp = precalc.getInterpDistProbs(a,ee)
+	return interp
+
+def probObjAtDistRnumericGrid(R,a,e):
+	interp = probObjAtDistRnumericGridInterpFunc(a,e)
+	return interp(R)
+
+def probObjAtDistRpiecewise(R,a,e):
+	ee = precalc.takeClosestPiecewise(e)
+	return precalc.piecewiseProb(R,a,ee)
 
 if diag:
 	before=time()
 	prob=probObjAtDistR(useDiscR,useA, useE)
 	after = time()
-	print "\nProbability object with a/e is at discR:",prob," which took ", round(after-before,8)," seconds\n"	
-
+	print "\nProbability object with a/e is at discR (approx):",prob," which took ", round(after-before,8)," seconds\n"	
+	before=time()
+	prob=probObjAtDistRnumeric(useDiscR,useA, useE)
+	after = time()
+	print "\nProbability object with a/e is at discR (numeric):",prob," which took ", round(after-before,8)," seconds\n"	
+	before=time()
+	prob=probObjAtDistRnumericGrid(useDiscR,useA, useE)
+	after = time()
+	print "\nProbability object with a/e is at discR (numeric grid):",prob," which took ", round(after-before,8)," seconds\n"	
+	before=time()
+#	prob=precalc.piecewiseProb(useDiscR,useA, useE)
+	prob=probObjAtDistRpiecewise(useDiscR,useA, useE)
+	after = time()
+	print "\nProbability object with a/e is at discR (piecewise linear fit):",prob," which took ", round(after-before,8)," seconds\n"	
 
 def magAtDistRfromHmag(H, R): 
 	return (H + 5.*math.log(R/1, 10) + 5. * math.log((R - 1)/1,10))
@@ -200,8 +298,16 @@ def magObjAtDistR(discMag, discR, R):
 if diag:
 	print "Magnitude at testR: "+str(round( magObjAtDistR(useDiscM, useDiscR, testR), 3))
 
+## Switch out between different distance probability approximations for testing purposes
 def integrateMe(R, a, e, discMag, discR, fieldN):
 	return probObjAtDistR(R, a,e)*detectionEff(fieldN, magObjAtDistR(discMag, discR, R))
+
+def integrateMePiecewise(R, a, e, discMag, discR, fieldN):
+	return probObjAtDistRpiecewise(R, a,e)*detectionEff(fieldN, magObjAtDistR(discMag, discR, R))
+
+def integrateMeNumeric(R, interpFunc, discMag, discR, fieldN):
+	return interpFunc(R)*detectionEff(fieldN, magObjAtDistR(discMag, discR, R))
+
 
 #if diag:
 #	print "For instance, at some random values integrate me returns:",integrateMe(42, 43., 0.05, 22., 44., 0)
@@ -212,13 +318,29 @@ def magLikelihoodObjInField(a, e, discMag, discR, useNfields=len(fieldLats)):
 	likelyList=[]
 #	print "Finding mag likelihood", a, e, discMag, discR
 	## if ecc is very low:
-	if e < 10**-6:
+	if e < 10**-4:
 		for nn in range(useNfields):
 			likelyList.append(detectionEff(nn, magObjAtDistR(discMag, discR, a)))
 	else:
+		### The approximations only work for pre-calculated values of e
+		if doPiecewise:
+			ee = precalc.takeClosestPiecewise(e) ## Only have a grid defined
+			# print "using precalc ecc:",e,ee
+		if doNumeric:
+			if doNumericGrid:
+				distanceInterpFunction = probObjAtDistRnumericGridInterpFunc(a,e)
+			else:
+				distanceInterpFunction = probObjAtDistRinterpFunc(a,e)
+		
 		for nn in range(useNfields):
-			### This numerical intergration method was plucked from scipy with little thought to alternatives
-			res, err = quad(integrateMe, minR(a,e), maxR(a,e),args=(a, e, discMag, discR, nn))
+			### The numerical intergration method was plucked from scipy with little thought to alternatives
+			if doNumeric:
+				res, err = quad(integrateMeNumeric, minR(a,e), maxR(a,e),args=(distanceInterpFunction, discMag, discR, nn))
+			else:
+				if doPiecewise:
+					res, err = quad(integrateMePiecewise, minR(a,ee), maxR(a,ee),args=(a, ee, discMag, discR, nn), points=(a*precalc.pt1[ee], a*precalc.pt2[ee], a*precalc.pt3[ee], a*precalc.pt4[ee]))
+				else:
+					res, err = quad(integrateMe, minR(a,e), maxR(a,e),args=(a, e, discMag, discR, nn))
 			likelyList.append(res)
 	return likelyList
 
@@ -420,3 +542,93 @@ allDESresonant = ["118378", "119066", "119068", "119069", "119070", "119473",  "
 ### lazy  means I want to only calculate inc likelihoods for chip 2
 # Grids are run lazy=True; real objects aren't (tiny difference: for 19521, P=0.07183 lazy and 0.07181 not)
 runAllInputObjects(areWeLazy=False)
+
+
+
+
+
+
+
+########### ########### ########### Tests ########### ########### ########### 
+#testA = 39.322
+#testE = 0.1
+#discR = 47.977
+#discMag = 19.14
+#
+#
+#testA = 544.4
+#testE1 = 0.8599
+#testE = precalc.takeClosestPiecewise(testE1)
+#discR = 86.762
+#discMag = 21.029
+#
+#
+#fieldN = 100
+##for R in np.arange(minR(testA,testE), maxR(testA,testE),100.):
+#for R in [minR(testA,testE)-0.1, minR(testA,testE), minR(testA,testE)+0.1, maxR(testA,testE), maxR(testA,testE)+0.1]:
+#	print R, integrateMe(R, testA, testE, discMag, discR, fieldN), integrateMePiecewise(R, testA, testE, discMag, discR, fieldN)
+
+### Test of average distance
+testA = 39.322
+testE = 0.1
+discR = 47.977
+discMag = 19.14
+
+# the "average distance" is defined as having 0.5 prob of being closer and 0.5 prob of being further
+# ie, P(R=R_min to R_ave) = P(R=R_ave to R_max)
+# This ONLY works for the piecewise approximation because we don't care about the rest
+def integProb(R,a,ee):
+	if R < a*precalc.pt1[ee]:
+		integPoints = ()
+	elif R < a*precalc.pt2[ee]:
+		integPoints = (a*precalc.pt1[ee])
+	elif R < a*precalc.pt3[ee]:
+		integPoints = (a*precalc.pt1[ee], a*precalc.pt2[ee])
+	elif R < a*precalc.pt4[ee]:
+		integPoints = (a*precalc.pt1[ee], a*precalc.pt2[ee], a*precalc.pt3[ee])
+	else:
+		integPoints = (a*precalc.pt1[ee], a*precalc.pt2[ee], a*precalc.pt3[ee], a*precalc.pt4[ee])
+	res1, err1 = quad(probObjAtDistRpiecewise, minR(a,ee), R, args=(a, ee), points=integPoints)
+	resFull, errFull = quad(probObjAtDistRpiecewise, minR(a,ee), maxR(a,ee), args=(a, ee), points=(a*precalc.pt1[ee], a*precalc.pt2[ee], a*precalc.pt3[ee], a*precalc.pt4[ee]))
+	# we want where this is equal to 0.5
+	return res1/resFull - 0.5
+
+def findAverageDistance(a, e): 
+	likelyList=[]
+	## if ecc is very low:
+	if e < 10**-4:
+		return a # a=R for all intents	
+	else:
+		### The approximations only work for pre-calculated values of e
+		ee = precalc.takeClosestPiecewise(e) ## Only have a grid defined
+		aveR = 0.5*(minR(a,ee)+maxR(a,ee)) # starting position
+		# Now integrate the prob(R) out to ave R to find where it is 0.5
+	#	print integProb(aveR, a, ee), integProb(minR(a,ee), a, ee), integProb(maxR(a,ee), a, ee)
+		res2 = brentq(integProb, minR(a,ee), maxR(a,ee), args=(a,ee))	
+	#	print res2,aveR
+	return aveR
+
+
+## Find median dist for real objects
+
+distFile = probabilityDir + "_distances.tsv";
+g = open(distFile,"w")
+print >>g,  "\t".join(["object", "a","e","peri","discR","medianR"])
+
+def medianDistRealObj(obj,extra=""):
+	values,names = importElems(obj,extra)
+	medianDist = findAverageDistance(eval(values["a_now"]), eval(values["e_now"]))
+	discDist = values["discR"]
+	minDist = minR(eval(values["a_now"]), eval(values["e_now"]))
+	print >>g, "\t".join([obj, values["a_now"], values["e_now"], str(round(minDist,3)), values["discR"], str(round(medianDist,3))])
+	return medianDist,discDist
+	
+
+### Run for all objects	 
+allPotentialInput = os.listdir(inputDir+extra)
+for aa in allPotentialInput:
+	if ((aa != "_allFields.tsv") & (aa != ".DS_Store")):
+		obj = string.replace(aa,".tsv","")
+		medianDist,discDist=medianDistRealObj(obj)
+
+g.close()
